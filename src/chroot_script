@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -x
+# OctoPI generation script
+# Helper script that runs in a Raspbian chroot to create the OctoPI distro
+# Written by Guy Sheffer <guysoft at gmail dot com>
+# GPL V3
+fixLd(){
+  sed -i 's@/usr/lib/arm-linux-gnueabihf/libcofi_rpi.so@\#/usr/lib/arm-linux-gnueabihf/libcofi_rpi.so@' /etc/ld.so.preload
+}
+
+gitclone(){
+if [ $GIT_REPO_OVERRIDE != "" ] ; then
+    REPO=$GIT_REPO_OVERRIDE`echo $1 | awk -F '/' '{print $(NF)}'`
+    sudo -u pi git clone $REPO
+    sudo -u pi git remote set-url $1
+else
+    sudo -u pi git clone $1
+fi
+}
+
+unpackHome(){
+  shopt -s dotglob
+  cp -av /filesystem/home/* /home/pi
+  shopt -u dotglob
+  chown -hR pi:pi /home/pi
+}
+
+unpackRoot(){
+  shopt -s dotglob
+  cp -av /filesystem/root/* /
+  shopt -u dotglob
+}
+
+unpackBoot(){
+  shopt -s dotglob
+  cp -av /filesystem/boot/* /boot
+  shopt -u dotglob
+}
+
+fixLd
+unpackHome
+unpackBoot
+apt-get update
+
+apt-get remove -y --purge scratch squeak-plugins-scratch squeak-vm wolfram-engine python-minecraftpi minecraft-pi sonic-pi oracle-java8-jdk
+
+#apt-get octoprint virtualenv
+apt-get -y --force-yes install python-virtualenv python-dev git python-numpy screen libts-bin
+
+pushd /home/pi
+  
+  #build virtualenv
+  sudo -u pi virtualenv --system-site-packages oprint
+  
+  #OctoPrint
+  gitclone https://github.com/foosel/OctoPrint.git
+  pushd OctoPrint
+    sudo -u pi /home/pi/oprint/bin/python setup.py install
+  popd
+
+  #OctoPiPanel
+  gitclone https://github.com/jonaslorander/OctoPiPanel.git
+  pushd OctoPiPanel
+    sudo -u pi /home/pi/oprint/bin/pip install -r requirements.txt
+  popd
+
+  #Make sure user pi has access to serial ports
+  sudo usermod -a -G tty pi
+  sudo usermod -a -G dialout pi
+      
+  #mjpg-streamer
+  sudo apt-get -y --force-yes install subversion libjpeg8-dev imagemagick libav-tools cmake libv4l-dev
+  gitclone https://github.com/jacksonliam/mjpg-streamer.git
+  pushd mjpg-streamer
+    mv mjpg-streamer-experimental/* .
+    sudo -u pi make
+  popd
+  
+  #Add pyserial that can handle non-standard baud rates
+  sudo -u pi svn co http://pyserial.svn.sourceforge.net/svnroot/pyserial/trunk pyserial
+  pushd pyserial
+      pushd pyserial
+          sudo -u pi /home/pi/oprint/bin/python setup.py install
+      popd
+  popd
+  
+  #make autostart scripts
+  pushd scripts
+    chmod 755 webcamDaemon
+    chmod 755 genCert
+  popd
+  
+  #setup haproxy for http and https, and webcam
+  export HAPROXY_VERSION=1.5.8
+  sudo apt-get -y --force-yes install ssl-cert libssl-dev libpcre3-dev checkinstall
+  rm /etc/ssl/private/ssl-cert-snakeoil.key /etc/ssl/certs/ssl-cert-snakeoil.pem
+  sudo -u pi wget http://www.haproxy.org/download/1.5/src/haproxy-${HAPROXY_VERSION}.tar.gz
+  sudo -u pi tar xzvf haproxy-${HAPROXY_VERSION}.tar.gz
+  rm haproxy-${HAPROXY_VERSION}.tar.gz
+  sudo -u pi mv `ls | grep haproxy | head -n 1` haproxy-ss
+  pushd haproxy-ss
+    sudo -u pi make TARGET=linux2628 USE_LINUX_SPLICE=1 USE_LINUX_TPROXY=1 USE_PCRE=1 USE_OPENSSL=1
+    mkdir -p /usr/local/share/man/man1 /usr/local/doc /usr/local/doc/haproxy
+    sudo checkinstall --default --pkgname haproxy --pkgversion 1.5
+  popd
+  rm -rf haproxy-ss
+
+  adduser --system --disabled-password --disabled-login --home /var/lib/haproxy \
+          --no-create-home --quiet --force-badname --group haproxy
+
+  #Add fbcp for TFT screens
+  gitclone https://github.com/tasanakorn/rpi-fbcp
+  pushd rpi-fbcp
+    mkdir build
+    pushd build
+      cmake ..
+      make
+      install fbcp /usr/local/bin/fbcp
+      make clean
+    popd
+  popd
+popd
+
+sed -i 's@exit 0@@' /etc/rc.local
+
+echo "/home/pi/scripts/genCert" >> /etc/rc.local
+echo "sudo -u pi /home/pi/scripts/webcamDaemon &" >> /etc/rc.local
+echo "/usr/local/sbin/haproxy -f /etc/haproxy/haproxy.cfg" >> /etc/rc.local
+echo "exit 0" >> /etc/rc.local
+
+#automatic startup
+echo "pi ALL=NOPASSWD: /sbin/shutdown" > /etc/sudoers.d/octoprint-shutdown
+echo "pi ALL=NOPASSWD: /sbin/service" > /etc/sudoers.d/octoprint-service
+
+#reach printer by name
+sudo apt-get -y --force-yes install avahi-daemon
+echo octopi > /etc/hostname
+sed -i 's@raspberrypi@octopi@' /etc/hosts
+
+# enable raspicam
+echo "# enable raspicam" >> /boot/config.txt
+echo "start_x=1" >> /boot/config.txt
+echo "gpu_mem=128" >> /boot/config.txt
+
+#unpack root in the end, so etc file are not overwritten, might need to add two roots int he future
+unpackRoot
+
+#setup runlevels for initscripts
+sudo update-rc.d octoprint defaults 99
+
+#cleanup
+fixLd
+sudo apt-get clean
+
+sed -i 's@\#/usr/lib/arm-linux-gnueabihf/libcofi_rpi.so@/usr/lib/arm-linux-gnueabihf/libcofi_rpi.so@' /etc/ld.so.preload
